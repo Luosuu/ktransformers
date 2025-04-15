@@ -19,7 +19,7 @@ import torch
 import sys, os
 from ktransformers.operators.base_operator import BaseInjectedModule
 from tqdm import tqdm
-
+import triton.profiler as proton
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "ktransformers_ext", "build"))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "ktransformers_ext", "build", "Release"))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "ktransformers_ext", "build", "Debug"))
@@ -820,43 +820,44 @@ class KDeepseekV2MoE(BaseInjectedModule, DeepseekV2MoE):
 class KDeepseekV3MoE(BaseInjectedModule, DeepseekV3MoE):
     
     def forward(self, hidden_states):
-        identity = hidden_states
-        orig_shape = hidden_states.shape
-        sequence_length = orig_shape[1]
-        topk_idx, topk_weight = self.gate(hidden_states)
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        
-        # only for generate phase
-        if sequence_length == 1 and hasattr(self.experts.generate_experts, "submit_for_one_decode") and torch.cuda.is_current_stream_capturing():
-            self.experts.generate_experts.submit_for_one_decode(hidden_states[0], topk_idx[0], topk_weight[0])
+        with proton.cpu_timed_scope("KDeepseekV3MoE"):
+            identity = hidden_states
+            orig_shape = hidden_states.shape
+            sequence_length = orig_shape[1]
+            topk_idx, topk_weight = self.gate(hidden_states)
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+            
+            # only for generate phase
+            if sequence_length == 1 and hasattr(self.experts.generate_experts, "submit_for_one_decode") and torch.cuda.is_current_stream_capturing():
+                self.experts.generate_experts.submit_for_one_decode(hidden_states[0], topk_idx[0], topk_weight[0])
+                if self.config.n_shared_experts is not None:
+                    y_ = self.shared_experts(identity).squeeze(0)
+                y = self.experts.generate_experts.sync_for_one_decode().unsqueeze(0)
+                y += y_
+                y.resize_(*orig_shape)
+                return y
+
             if self.config.n_shared_experts is not None:
                 y_ = self.shared_experts(identity).squeeze(0)
-            y = self.experts.generate_experts.sync_for_one_decode().unsqueeze(0)
-            y += y_
-            y.resize_(*orig_shape)
-            return y
-
-        if self.config.n_shared_experts is not None:
-            y_ = self.shared_experts(identity).squeeze(0)
-            
-        if isinstance(self.experts, KExpertsBase):
-            y = self.moe_kexperts(hidden_states, topk_idx, topk_weight).view(*orig_shape).to(device=hidden_states.device)
-        elif hidden_states.size(0) > 10:
-            # TODO may bugs here
-            y = (
-                self.moe_infer(hidden_states, topk_idx, topk_weight)
-                .view(*orig_shape)
-                .to(device=hidden_states.device)
-            )
-        else:
-            # TODO may bugs here
-            y = (
-                self.moe_infer_simple(hidden_states, topk_idx, topk_weight)
-                .view(*orig_shape)
-                .to(device=hidden_states.device)
-            )
-        if self.config.n_shared_experts is not None:
-            y += y_
+                
+            if isinstance(self.experts, KExpertsBase):
+                y = self.moe_kexperts(hidden_states, topk_idx, topk_weight).view(*orig_shape).to(device=hidden_states.device)
+            elif hidden_states.size(0) > 10:
+                # TODO may bugs here
+                y = (
+                    self.moe_infer(hidden_states, topk_idx, topk_weight)
+                    .view(*orig_shape)
+                    .to(device=hidden_states.device)
+                )
+            else:
+                # TODO may bugs here
+                y = (
+                    self.moe_infer_simple(hidden_states, topk_idx, topk_weight)
+                    .view(*orig_shape)
+                    .to(device=hidden_states.device)
+                )
+            if self.config.n_shared_experts is not None:
+                y += y_
         return y
 
     @torch.no_grad()

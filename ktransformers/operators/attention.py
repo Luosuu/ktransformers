@@ -21,6 +21,8 @@ import logging
 from transformers.configuration_utils import PretrainedConfig
 from transformers.cache_utils import Cache
 from ktransformers.util.vendors import device_manager, get_device, to_device, GPUVendor
+import triton.profiler as proton
+from viztracer import log_sparse
 
 try:
     from flash_attn import flash_attn_func
@@ -358,10 +360,12 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
 
         bsz, q_len, _ = hidden_states.size()
 
-        if self.q_lora_rank is None:
-            q = self.q_proj(hidden_states)
-        else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        with proton.cpu_timed_scope("KDeepSeekV2Attention - forward_linux_flashinfer - q_proj"):
+            if self.q_lora_rank is None:
+                q = self.q_proj(hidden_states)
+            else:
+                q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+
         q = q.view(bsz, q_len, self.num_heads, self.q_head_dim)
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -385,62 +389,69 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         
-        cos, sin = self.rotary_emb(q_pe, position_ids)
-        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, unsqueeze_dim=2)
+        with proton.cpu_timed_scope("KDeepSeekV2Attention - forward_linux_flashinfer - rotary_emb"):
+            cos, sin = self.rotary_emb(q_pe, position_ids)
+        with proton.cpu_timed_scope("KDeepSeekV2Attention - forward_linux_flashinfer - apply_rotary_pos_emb"):
+            q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, unsqueeze_dim=2)
         # q_pe [bsz, q_len, self.num_heads, self.qk_rope_head_dim] k_pe [bsz, q_len, 1, self.qk_rope_head_dim]
         
         # decode
         if q_len == 1 or self.absorb_for_prefill:
             if past_key_value is not None:
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-                compressed_kv_with_k_pe, page_table = past_key_value.update(compressed_kv, k_pe, self.layer_idx, cache_kwargs)
+                with proton.cpu_timed_scope("KDeepSeekV2Attention - forward_linux_flashinfer - kv_cache update"):
+                    compressed_kv_with_k_pe, page_table = past_key_value.update(compressed_kv, k_pe, self.layer_idx, cache_kwargs)
                 compressed_kv = compressed_kv_with_k_pe [:, :, :, :self.kv_lora_rank].view(-1, past_key_value.page_size, self.kv_lora_rank)
                 k_pe = compressed_kv_with_k_pe [:, :, :, self.kv_lora_rank:].view(-1, past_key_value.page_size, self.qk_rope_head_dim)
                 # k_pe [max_pages, page_size, self.qk_rope_head_dim]
                 # compressed_kv [max_pages, page_size, self.kv_lora_rank]
 
-            # q_nope [bsz, q_len, self.num_heads, self.qk_nope_head_dim]
-            # q_absorb [self.num_heads, self.qk_nope_head_dim, self.kv_lora_rank]
-            q_absorb, out_absorb = self.get_absorbed()
-            q_nope = q_nope.transpose(1, 2) # q_len is 1, no GPU overhead, same below
-            q_nope = torch.matmul(q_nope, q_absorb) # batched MM
-            q_nope = q_nope.transpose(1, 2)
-            q_nope = q_nope.contiguous()
-            #assert q_nope.is_contiguous()
+            with proton.cpu_timed_scope("KDeepSeekV2Attention - forward_linux_flashinfer - torch.matmul(q_nope, q_absorb)"):
+                # q_nope [bsz, q_len, self.num_heads, self.qk_nope_head_dim]
+                # q_absorb [self.num_heads, self.qk_nope_head_dim, self.kv_lora_rank]
+                q_absorb, out_absorb = self.get_absorbed()
+                q_nope = q_nope.transpose(1, 2) # q_len is 1, no GPU overhead, same below
+                q_nope = torch.matmul(q_nope, q_absorb) # batched MM
+                q_nope = q_nope.transpose(1, 2)
+                q_nope = q_nope.contiguous()
+                #assert q_nope.is_contiguous()
             
             # q_nope [bsz, q_len, self.num_heads, self.kv_lora_rank]
             # q_pe [bsz, q_len, self.num_heads, self.qk_rope_head_dim]
-            q_nope.squeeze_(0)
-            q_pe.squeeze_(0)
+            with proton.cpu_timed_scope("KDeepSeekV2Attention - forward_linux_flashinfer - q_nope, q_pe squeeze before MLA"):
+                q_nope.squeeze_(0)
+                q_pe.squeeze_(0)
 
             # flash attn doesn't support head_dim bigger than 256, use flashinfer
-            if self.mla_wrapper is None:
-                self.mla_wrapper = MLAWrapperSingleton.get_instance(self.device, 1, past_key_value.max_pages, use_cuda_graph = True)
-            if self.mla_wrapper.need_plan:
-                self.mla_wrapper.need_plan = False
-                if q_len == 1:
-                    self.mla_wrapper.plan(None,None,None,
-                                        position_ids.squeeze(1)+1,
-                                        self.num_heads,
-                                        self.kv_lora_rank,
-                                        self.qk_rope_head_dim,
-                                        past_key_value.page_size,
-                                        self.softmax_scale,
-                                        q_nope.dtype,
-                                        compressed_kv.dtype)
-                else:
-                    qo_indptr = torch.tensor([0, q_len], dtype=torch.int32, device=self.device)
-                    kv_len_arr = torch.tensor([position_ids[0, -1].item()+1], dtype=torch.int32, device=self.device)
-                    self.mla_wrapper.plan(qo_indptr,None,None,
-                                        kv_len_arr,
-                                        self.num_heads,
-                                        self.kv_lora_rank,
-                                        self.qk_rope_head_dim,
-                                        past_key_value.page_size,
-                                        self.softmax_scale,
-                                        q_nope.dtype,
-                                        compressed_kv.dtype)
-            attn_output = self.mla_wrapper.run(q_nope, q_pe, compressed_kv, k_pe).view(bsz, q_len, self.num_heads, self.kv_lora_rank)
+            with proton.cpu_timed_scope("KDeepSeekV2Attention - forward_linux_flashinfer - get MLA plan"):
+                if self.mla_wrapper is None:
+                    self.mla_wrapper = MLAWrapperSingleton.get_instance(self.device, 1, past_key_value.max_pages, use_cuda_graph = True)
+                if self.mla_wrapper.need_plan:
+                    self.mla_wrapper.need_plan = False
+                    if q_len == 1:
+                        self.mla_wrapper.plan(None,None,None,
+                                            position_ids.squeeze(1)+1,
+                                            self.num_heads,
+                                            self.kv_lora_rank,
+                                            self.qk_rope_head_dim,
+                                            past_key_value.page_size,
+                                            self.softmax_scale,
+                                            q_nope.dtype,
+                                            compressed_kv.dtype)
+                    else:
+                        qo_indptr = torch.tensor([0, q_len], dtype=torch.int32, device=self.device)
+                        kv_len_arr = torch.tensor([position_ids[0, -1].item()+1], dtype=torch.int32, device=self.device)
+                        self.mla_wrapper.plan(qo_indptr,None,None,
+                                            kv_len_arr,
+                                            self.num_heads,
+                                            self.kv_lora_rank,
+                                            self.qk_rope_head_dim,
+                                            past_key_value.page_size,
+                                            self.softmax_scale,
+                                            q_nope.dtype,
+                                            compressed_kv.dtype)
+            with proton.cpu_timed_scope("KDeepSeekV2Attention - forward_linux_flashinfer - MLA run"):
+                attn_output = self.mla_wrapper.run(q_nope, q_pe, compressed_kv, k_pe).view(bsz, q_len, self.num_heads, self.kv_lora_rank)
             """
             k = (
                 torch.cat([compressed_kv, k_pe], dim=-1)
@@ -460,16 +471,18 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             )
             attn_output = attn_ref.view(bsz, q_len, self.num_heads, self.kv_lora_rank)
             """
-            
-            # mla_wrapper run output: [tokens, self.num_heads, self.kv_lora_rank]
-            # attn_output [bsz, q_len, self.num_heads, self.kv_lora_rank]
-            # out_absorb [self.num_heads, self.v_head_dim, self.kv_lora_rank]
-            attn_output = attn_output.transpose(1, 2) # [bsz, self.num_heads, q_len, self.kv_lora_rank]
-            attn_output = torch.matmul(attn_output, out_absorb.mT) # [bsz, self.num_heads, q_len, self.v_head_dim]
-            attn_output = attn_output.transpose(1, 2).contiguous() # [bsz, q_len, self.num_heads, self.kv_lora_rank]
-            
-            attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim) # [bsz, q_len, self.num_heads * self.v_head_dim]
-            attn_output = self.o_proj(attn_output)
+            with proton.cpu_timed_scope("KDeepSeekV2Attention - forward_linux_flashinfer - torch.matmul(attn_output, out_absorb.mT)"):
+                # mla_wrapper run output: [tokens, self.num_heads, self.kv_lora_rank]
+                # attn_output [bsz, q_len, self.num_heads, self.kv_lora_rank]
+                # out_absorb [self.num_heads, self.v_head_dim, self.kv_lora_rank]
+                attn_output = attn_output.transpose(1, 2) # [bsz, self.num_heads, q_len, self.kv_lora_rank]
+                attn_output = torch.matmul(attn_output, out_absorb.mT) # [bsz, self.num_heads, q_len, self.v_head_dim]
+                attn_output = attn_output.transpose(1, 2).contiguous() # [bsz, q_len, self.num_heads, self.kv_lora_rank]
+
+            with proton.cpu_timed_scope("KDeepSeekV2Attention - forward_linux_flashinfer - attn_output.reshape"):
+                attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim) # [bsz, q_len, self.num_heads * self.v_head_dim]
+            with proton.cpu_timed_scope("KDeepSeekV2Attention - forward_linux_flashinfer - output projection"):
+                attn_output = self.o_proj(attn_output)
             
             return attn_output, None, past_key_value
         else:
@@ -608,27 +621,29 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             )
         else:
             if flashinfer_enabled:
-                return self.forward_linux_flashinfer(
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_value,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    **kwargs,
-                )
+                with proton.cpu_timed_scope("KDeepseekV2Attention-forward_linux_flashinfer"):
+                    return self.forward_linux_flashinfer(
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        past_key_value,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                        **kwargs,
+                    )
             else:
-                return self.forward_linux_triton(
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_value,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    **kwargs,
-                )
+                with proton.cpu_timed_scope("KDeepseekV2Attention-forward_linux_triton"):
+                    return self.forward_linux_triton(
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        past_key_value,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                        **kwargs,
+                    )
 
 
 class KLlamaAttention(BaseInjectedModule):

@@ -26,3 +26,5 @@ ktransformers/tests/chat_txt.txt
 mmlu_result*
 ktransformers/ktransformers_ext/cuda_musa/
 test_prompt.txt
+local_dev/
+*.hatchet

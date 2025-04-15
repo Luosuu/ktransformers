@@ -27,7 +27,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-
+import triton.profiler as proton
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.modeling_attn_mask_utils import (
@@ -386,7 +386,8 @@ class DeepseekV3MLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        with proton.cpu_timed_scope("DeepseekV3MLP-down_proj"):
+            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
 
@@ -398,7 +399,7 @@ class MoEGate(nn.Module):
         self.n_routed_experts = config.n_routed_experts
         self.routed_scaling_factor = config.routed_scaling_factor
         self.scoring_func = config.scoring_func
-        self.seq_aux = config.seq_aux
+        # self.seq_aux = config.seq_aux
         self.topk_method = config.topk_method
         self.n_group = config.n_group
         self.topk_group = config.topk_group
@@ -522,13 +523,16 @@ class DeepseekV3MoE(nn.Module):
     def forward(self, hidden_states):
         identity = hidden_states
         orig_shape = hidden_states.shape
-        topk_idx, topk_weight = self.gate(hidden_states)
+        with proton.cpu_timed_scope("DeepseekV3MoE-gate"):
+            topk_idx, topk_weight = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         flat_topk_idx = topk_idx.view(-1)
         if not self.training:
-            y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
+            with proton.cpu_timed_scope("DeepseekV3MoE-moe_infer"):
+                y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
         if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(identity)
+            with proton.cpu_timed_scope("DeepseekV3MoE-shared_experts"):
+                y = y + self.shared_experts(identity)
         return y
 
     @torch.no_grad()
@@ -1202,23 +1206,28 @@ class DeepseekV3DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
-        )
+        with proton.cpu_timed_scope("DeepseekV3DecoderLayer-self_attn"):
+            hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
         hidden_states = residual + hidden_states
 
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        with proton.cpu_timed_scope("DeepseekV3DecoderLayer-Fully_Connected_Module"):
+            residual = hidden_states
+            with proton.cpu_timed_scope("DeepseekV3DecoderLayer-post_attention_layernorm"):
+                hidden_states = self.post_attention_layernorm(hidden_states)
+            with proton.cpu_timed_scope("DeepseekV3DecoderLayer-mlp"):
+                hidden_states = self.mlp(hidden_states)
+            with proton.cpu_timed_scope("DeepseekV3DecoderLayer-merge"):
+                hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
 
@@ -1471,16 +1480,16 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_values,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-            )
+            with proton.cpu_timed_scope("DeepSeekV3Model-forward-decoder_layer"):
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                )
 
             hidden_states = layer_outputs[0]
 
@@ -1699,7 +1708,8 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states[:,-1:,:])
+        with proton.cpu_timed_scope("DeepseekV3ForCasualLM-forward-lm_heads(MLP)"):
+            logits = self.lm_head(hidden_states[:,-1:,:])
         logits = logits.float()
 
         loss = None
@@ -1735,60 +1745,61 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         inputs_embeds=None,
         **kwargs,
     ):
-        if past_key_values is not None:
-            if isinstance(past_key_values, Cache):
-                cache_length = past_key_values.get_seq_length()
-                past_length = past_key_values.seen_tokens
-                max_cache_length = past_key_values.get_max_length()
+        with proton.cpu_timed_scope("DeepseekV3ForCausalLM-prepare_inputs_for_generation"):
+            if past_key_values is not None:
+                if isinstance(past_key_values, Cache):
+                    cache_length = past_key_values.get_seq_length()
+                    past_length = past_key_values.seen_tokens
+                    max_cache_length = past_key_values.get_max_length()
+                else:
+                    cache_length = past_length = past_key_values[0][0].shape[2]
+                    max_cache_length = None
+
+                # Keep only the unprocessed tokens:
+                # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
+                # some of the inputs are exclusivelly passed as part of the cache (e.g. when passing input_embeds as
+                # input)
+                if (
+                    attention_mask is not None
+                    and attention_mask.shape[1] > input_ids.shape[1]
+                ):
+                    input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+                # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
+                # input_ids based on the past_length.
+                elif past_length < input_ids.shape[1]:
+                    input_ids = input_ids[:, past_length:]
+                # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
+
+                # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
+                if (
+                    max_cache_length is not None
+                    and attention_mask is not None
+                    and cache_length + input_ids.shape[1] > max_cache_length
+                ):
+                    attention_mask = attention_mask[:, -max_cache_length:]
+
+            position_ids = kwargs.get("position_ids", None)
+            if attention_mask is not None and position_ids is None:
+                # create position_ids on the fly for batch generation
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 1)
+                if past_key_values:
+                    position_ids = position_ids[:, -input_ids.shape[1] :]
+
+            # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+            if inputs_embeds is not None and past_key_values is None:
+                model_inputs = {"inputs_embeds": inputs_embeds}
             else:
-                cache_length = past_length = past_key_values[0][0].shape[2]
-                max_cache_length = None
+                model_inputs = {"input_ids": input_ids}
 
-            # Keep only the unprocessed tokens:
-            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
-            # some of the inputs are exclusivelly passed as part of the cache (e.g. when passing input_embeds as
-            # input)
-            if (
-                attention_mask is not None
-                and attention_mask.shape[1] > input_ids.shape[1]
-            ):
-                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
-            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
-            # input_ids based on the past_length.
-            elif past_length < input_ids.shape[1]:
-                input_ids = input_ids[:, past_length:]
-            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
-
-            # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
-            if (
-                max_cache_length is not None
-                and attention_mask is not None
-                and cache_length + input_ids.shape[1] > max_cache_length
-            ):
-                attention_mask = attention_mask[:, -max_cache_length:]
-
-        position_ids = kwargs.get("position_ids", None)
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
-
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and past_key_values is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
-        model_inputs.update(
-            {
-                "position_ids": position_ids,
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache"),
-                "attention_mask": attention_mask,
-            }
-        )
+            model_inputs.update(
+                {
+                    "position_ids": position_ids,
+                    "past_key_values": past_key_values,
+                    "use_cache": kwargs.get("use_cache"),
+                    "attention_mask": attention_mask,
+                }
+            )
         return model_inputs
 
     @staticmethod

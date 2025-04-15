@@ -65,6 +65,7 @@ from ktransformers.models.modeling_llama import (
     LlamaRMSNorm,
     LlamaRotaryEmbedding,
 )
+import triton.profiler as proton
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -726,15 +727,16 @@ class KDeepseekV2Model(BaseInjectedModule):
                 t4 = time.time()
                 # with open("log.txt", "a") as f:
                 #     f.write(f"@@@@@@@@@@@@@@@@@layer {i}@@@@@@@@@@@@@@@@@@@@ \n")
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                )
+                with proton.cpu_timed_scope("KDeepseekV2Model-decoder_layer"):
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                    )
                 t5 = time.time()
                 if per_layer_prefill_flag:
                     # print(f"to cpu")

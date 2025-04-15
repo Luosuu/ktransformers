@@ -37,7 +37,7 @@ from ktransformers.operators.cpuinfer import CPUInfer
 from ktransformers.server.config.config import Config
 from typing import Dict, Tuple, Optional, Union
 import numpy as np
-
+import triton.profiler as proton
 #class KLinearBase(BaseInjectedModule, ABC):
 class KLinearBase(ABC):
     def __init__(
@@ -671,10 +671,12 @@ class KTransformersLinear(BaseInjectedModule, KLinearBase):
     def forward(self, x):
         if self.mode == InferenceState.PREFILL:
             assert self.prefill_linear is not None, "cpu linear is not initialized"
-            y = self.prefill_linear.forward(x)
+            with proton.cpu_timed_scope("KTransformersLinear-prefill_linear"):
+                y = self.prefill_linear.forward(x)
         else:
             assert self.generate_linear is not None, "gpu linear is not initialized"
-            y = self.generate_linear.forward(x)
+            with proton.cpu_timed_scope("KTransformersLinear-generate_linear"):
+                y = self.generate_linear.forward(x)
         return y
 
     def load(self, w: dict | nn.Parameter | tuple | None = None, mode: InferenceState = InferenceState.GENERATE):

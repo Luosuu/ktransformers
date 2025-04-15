@@ -65,6 +65,7 @@ from transformers.utils.import_utils import is_torch_fx_available
 from .configuration_deepseek import DeepseekV2Config
 import torch.distributed as dist
 import numpy as np
+import triton.profiler as proton
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
@@ -571,7 +572,8 @@ class DeepseekV2MoE(nn.Module):
             y = y.view(*orig_shape)
             y = AddAuxiliaryLoss.apply(y, aux_loss)
         else:
-            y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
+            with proton.scope("MoE-Inference"):
+                y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
         if self.config.n_shared_experts is not None:
             y = y + self.shared_experts(identity)
         return y
@@ -1235,23 +1237,27 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
-        )
+        with proton.scope("DecoderLayer-self-attn"):
+            hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
 
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        with proton.scope("DecoderLayer-LayerNorm-after-self-attn"):
+            hidden_states = self.post_attention_layernorm(hidden_states)
+
+        with proton.scope("DecoderLayer-MoE-layer-after-self-attn"):
+            hidden_states = self.mlp(hidden_states)
 
         hidden_states = residual + hidden_states
 

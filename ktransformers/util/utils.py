@@ -18,7 +18,8 @@ from ktransformers.models.custom_cache import StaticCache
 from ktransformers.util.cuda_graph_runner import CUDAGraphRunner
 from ktransformers.util.textstream import TextStreamer
 from ktransformers.operators.flashinfer_wrapper import MLAWrapperSingleton
-
+from viztracer import log_sparse
+import triton.profiler as proton
 warm_uped = False
 
 def get_compute_capability(device:torch.device = None):
@@ -124,6 +125,7 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
 
     tokens = []
     
+    @log_sparse(stack_depth=50)
     def decode_one_tokens(cuda_graph_runner, cur_token, position_ids, cache_position, past_key_values, logits_warper, generation_config, use_cuda_graph: bool = True):
         if cuda_graph_runner is None:
             use_cuda_graph = False
@@ -132,7 +134,8 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
         else:
             # custom_stream = torch.cuda.Stream()
             torch.cuda.set_device(torch_device)
-            inputs_embeds = model.model.embed_tokens(cur_token.to("cpu")).to(torch_device)
+            with proton.cpu_timed_scope("decode-embed_tokens"):
+                inputs_embeds = model.model.embed_tokens(cur_token.to("cpu")).to(torch_device)
             # with torch.cuda.stream(custom_stream):
             logits=model(inputs_embeds=inputs_embeds,
                         position_ids=position_ids,
@@ -144,27 +147,30 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
         for device in all_cuda_device:
             torch.cuda.synchronize(device)
         #print(logits)
-        next_token_scores = logits_warper(inputs, logits[:, -1, :])
-        if generation_config.do_sample:
-            probs = nn.functional.softmax(next_token_scores, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
-        else:
-            next_token = torch.argmax(next_token_scores, dim=-1)
+        with proton.cpu_timed_scope("next_token-sample"):
+            next_token_scores = logits_warper(inputs, logits[:, -1, :])
+            if generation_config.do_sample:
+                probs = nn.functional.softmax(next_token_scores, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                next_token = torch.argmax(next_token_scores, dim=-1)
         return next_token
     
     # TODO: use CUDA Graph for chunk prefill, may get small improvement
     def chunk_prefill(inputs, cache_position, past_key_values):
-        if mode == "long_context":
-            inputs_embeds = model.model.embed_tokens(inputs.to("cpu"))
-        else:
-            inputs_embeds = model.model.embed_tokens(inputs.to("cpu")).to(torch_device)
+        with proton.cpu_timed_scope("prefill-embed_tokens"):
+            if mode == "long_context":
+                inputs_embeds = model.model.embed_tokens(inputs.to("cpu"))
+            else:
+                inputs_embeds = model.model.embed_tokens(inputs.to("cpu")).to(torch_device)
         if use_flashinfer_mla:
             MLAWrapperSingleton.update_buffer(past_key_values.max_pages)
             MLAWrapperSingleton.need_plan_all()
-            
-        logits = model(
-            inputs_embeds = inputs_embeds, cache_position=cache_position, past_key_values=past_key_values, return_dict=False, use_cache=True
-        )[0][:,-1,:].unsqueeze(0).clone().to(torch_device)
+
+        with proton.cpu_timed_scope("prefill-generation"):    
+            logits = model(
+                inputs_embeds = inputs_embeds, cache_position=cache_position, past_key_values=past_key_values, return_dict=False, use_cache=True
+            )[0][:,-1,:].unsqueeze(0).clone().to(torch_device)
         
         return logits
     
@@ -208,12 +214,13 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
             logits = chunk_prefill(inputs[:, chunk_start:chunk_end], cache_position[chunk_start:chunk_end], past_key_values)
             chunk_start += chunk_prefill_size
 
-        next_token_scores = logits_warper(inputs, logits[:, -1, :])
-        if generation_config.do_sample:
-            probs = nn.functional.softmax(next_token_scores, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
-        else:
-            next_token = torch.argmax(next_token_scores, dim=-1)
+        with proton.cpu_timed_scope("first_token-sample"):
+            next_token_scores = logits_warper(inputs, logits[:, -1, :])
+            if generation_config.do_sample:
+                probs = nn.functional.softmax(next_token_scores, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                next_token = torch.argmax(next_token_scores, dim=-1)
 
         first_token_time = time.time() - start_time
         
@@ -245,12 +252,15 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                 warm_uped = True
                 cuda_graph_runner = CUDAGraphRunner()
                 cuda_graph_runner.capture(model, next_token.unsqueeze(0), position_ids, cache_position, past_key_values, torch_device, return_dict=False, use_cache=True)
-            next_token = decode_one_tokens(cuda_graph_runner, next_token.unsqueeze(0), position_ids, cache_position, past_key_values, logits_warper, generation_config, use_cuda_graph).to(torch_device)
-            inputs = torch.cat((inputs, next_token.unsqueeze(0)), dim=-1)
-            generated_ids[:, cache_position] = next_token.int()
-            tokens.append(int(next_token))
-            seq_length += 1
+            with proton.cpu_timed_scope("decode_one_tokens-calls"):    
+                next_token = decode_one_tokens(cuda_graph_runner, next_token.unsqueeze(0), position_ids, cache_position, past_key_values, logits_warper, generation_config, use_cuda_graph).to(torch_device)
             
+            with proton.cpu_timed_scope("token_post_processing"):
+                inputs = torch.cat((inputs, next_token.unsqueeze(0)), dim=-1)
+                generated_ids[:, cache_position] = next_token.int()
+                tokens.append(int(next_token))
+
+            seq_length += 1
             if next_token[0].item() == tokenizer.eos_token_id or tokenizer.decode(next_token.tolist()) == '<|im_end|>':
                 print(stream.end(), end="", flush=True)
                 break

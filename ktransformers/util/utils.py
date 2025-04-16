@@ -19,6 +19,7 @@ from ktransformers.util.cuda_graph_runner import CUDAGraphRunner
 from ktransformers.util.textstream import TextStreamer
 from ktransformers.operators.flashinfer_wrapper import MLAWrapperSingleton
 import socket
+from viztracer import log_sparse
 
 warm_uped = False
 
@@ -126,6 +127,7 @@ def load_weights(module:nn.Module, gguf_loader:GGUFLoader, prefix=''):
     else:
         module.load()
 
+@log_sparse(stack_depth=100)
 def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cuda_graph: bool = True,
                          mode = 'normal', force_think: bool = False, chunk_size = 16384, use_flashinfer_mla = False,
                          num_heads = None, head_dim_ckv = None, head_dim_kpe = None, q_head_dim = None):

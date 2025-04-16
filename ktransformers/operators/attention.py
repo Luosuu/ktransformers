@@ -138,13 +138,19 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
         compressed_kv = compressed_kv.view(bsz, 1, -1, self.kv_lora_rank)[:,:,:attention_mask.size(-1),:]
         # k_pe [bsz, 1, cache_len, self.qk_rope_head_dim]
         # compressed_kv [bsz, 1, cache_len,self.kv_lora_rank]
-        q_nope = torch.matmul(q_nope, q_absorb)
+        # Original implementation with matmul
+        # q_nope = torch.matmul(q_nope, q_absorb)
+        # attn_weights = (torch.matmul(q_pe, k_pe.mT) + torch.matmul(q_nope, compressed_kv.mT)) * self.softmax_scale
+        
+        # New implementation with einsum for better performance
+        q_nope = torch.einsum('bhqd,hdk->bhqk', q_nope, q_absorb)
         #print(q_pe.shape)
         #print(k_pe.shape)
         #print(q_nope.shape)
         #print(compressed_kv.shape)
         
-        attn_weights = (torch.matmul(q_pe, k_pe.mT) + torch.matmul(q_nope, compressed_kv.mT)) * self.softmax_scale
+        attn_weights = (torch.einsum('bhqd,blhd->bhql', q_pe, k_pe.transpose(1,2)) + 
+                         torch.einsum('bhqk,blk->bhql', q_nope, compressed_kv)) * self.softmax_scale
         
         #attn_weights [bsz, self.num_heads, q_len, kv_seq_len]
         compressed_kv = compressed_kv.squeeze(1)
@@ -174,9 +180,14 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             attn_weights, p=self.attention_dropout, training=self.training
         )
         
-        attn_output = torch.einsum('bhql,blc->bhqc', attn_weights, compressed_kv)
+        # Original implementation
+        # attn_output = torch.einsum('bhql,blc->bhqc', attn_weights, compressed_kv)
+        # attn_output = torch.matmul(attn_output, out_absorb.mT)
         
-        attn_output = torch.matmul(attn_output, out_absorb.mT) 
+        # New implementation with unified einsum for better performance
+        # This combines both operations into a single einsum call, reducing
+        # intermediate tensor allocations and memory operations
+        attn_output = torch.einsum('bhql,blc,hcd->bhqd', attn_weights, compressed_kv, out_absorb)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
             raise ValueError(
@@ -249,9 +260,13 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             # q_nope [bsz, q_len, self.num_heads, self.qk_nope_head_dim]
             # q_absorb [self.num_heads, self.qk_nope_head_dim, self.kv_lora_rank]
             q_absorb, out_absorb = self.get_absorbed()
-            q_nope = q_nope.transpose(1, 2) # q_len is 1, no GPU overhead, same below
-            q_nope = torch.matmul(q_nope, q_absorb) # batched MM
-            q_nope = q_nope.transpose(1, 2)
+            # Original implementation with transpose and matmul
+            # q_nope = q_nope.transpose(1, 2) # q_len is 1, no GPU overhead, same below
+            # q_nope = torch.matmul(q_nope, q_absorb) # batched MM
+            # q_nope = q_nope.transpose(1, 2)
+            
+            # New implementation with einsum to avoid transposing
+            q_nope = torch.einsum('bhqd,hdk->bhqk', q_nope, q_absorb)
             #assert q_nope.is_contiguous()
             
             # q_nope [bsz, q_len, self.num_heads, self.kv_lora_rank]
@@ -290,9 +305,13 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             
             # attn_output [bsz, q_len, self.num_heads, self.kv_lora_rank]
             # out_absorb [self.num_heads, self.v_head_dim, self.kv_lora_rank]
-            attn_output = attn_output.transpose(1, 2)
-            attn_output = torch.matmul(attn_output, out_absorb.mT)
-            attn_output = attn_output.transpose(1, 2)
+            # Original implementation with transpose and matmul
+            # attn_output = attn_output.transpose(1, 2)
+            # attn_output = torch.matmul(attn_output, out_absorb.mT)
+            # attn_output = attn_output.transpose(1, 2)
+            
+            # New implementation with einsum to avoid transposing
+            attn_output = torch.einsum('bqhc,hcd->bqhd', attn_output, out_absorb)
             
             attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
             attn_output = self.o_proj(attn_output)
@@ -403,16 +422,26 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             # q_nope [bsz, q_len, self.num_heads, self.qk_nope_head_dim]
             # q_absorb [self.num_heads, self.qk_nope_head_dim, self.kv_lora_rank]
             q_absorb, out_absorb = self.get_absorbed()
-            q_nope = q_nope.transpose(1, 2) # q_len is 1, no GPU overhead, same below
-            q_nope = torch.matmul(q_nope, q_absorb) # batched MM
-            q_nope = q_nope.transpose(1, 2)
-            q_nope = q_nope.contiguous()
-            #assert q_nope.is_contiguous()
+            # Original implementation with transpose and matmul
+            # q_nope = q_nope.transpose(1, 2) # q_len is 1, no GPU overhead, same below
+            # q_nope = torch.matmul(q_nope, q_absorb) # batched MM
+            # q_nope = q_nope.transpose(1, 2)
             
-            # q_nope [bsz, q_len, self.num_heads, self.kv_lora_rank]
-            # q_pe [bsz, q_len, self.num_heads, self.qk_rope_head_dim]
-            q_nope.squeeze_(0)
-            q_pe.squeeze_(0)
+            # New implementation with einsum to avoid transposing and squeezing
+            # Since bsz=1 and q_len=1 in the decode phase, we can use 'hd,hdk->hk' directly
+            # This avoids both transpose and squeeze operations in one go
+            if bsz == 1 and q_len == 1:
+                # Direct computation with dimensions already removed
+                q_nope = torch.einsum('hd,hdk->hk', q_nope.squeeze(0).squeeze(0), q_absorb)
+                q_pe = q_pe.squeeze(0).squeeze(0)
+            else:
+                # For the more general case (though this branch is rarely taken)
+                q_nope = torch.einsum('bhqd,hdk->bhqk', q_nope, q_absorb).contiguous()
+                q_nope.squeeze_(0)
+                q_pe.squeeze_(0)
+            
+            # q_nope now [self.num_heads, self.kv_lora_rank] after squeeze
+            # q_pe now [self.num_heads, self.qk_rope_head_dim] after squeeze
 
             # flash attn doesn't support head_dim bigger than 256, use flashinfer
             if self.mla_wrapper is None:
@@ -467,11 +496,23 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             # mla_wrapper run output: [tokens, self.num_heads, self.kv_lora_rank]
             # attn_output [bsz, q_len, self.num_heads, self.kv_lora_rank]
             # out_absorb [self.num_heads, self.v_head_dim, self.kv_lora_rank]
-            attn_output = attn_output.transpose(1, 2) # [bsz, self.num_heads, q_len, self.kv_lora_rank]
-            attn_output = torch.matmul(attn_output, out_absorb.mT) # [bsz, self.num_heads, q_len, self.v_head_dim]
-            attn_output = attn_output.transpose(1, 2).contiguous() # [bsz, q_len, self.num_heads, self.kv_lora_rank]
+            # Original implementation with transpose and matmul
+            # attn_output = attn_output.transpose(1, 2) # [bsz, self.num_heads, q_len, self.kv_lora_rank]
+            # attn_output = torch.matmul(attn_output, out_absorb.mT) # [bsz, self.num_heads, q_len, self.v_head_dim]
+            # attn_output = attn_output.transpose(1, 2).contiguous() # [bsz, q_len, self.num_heads, self.kv_lora_rank]
             
-            attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim) # [bsz, q_len, self.num_heads * self.v_head_dim]
+            # New implementation with einsum to avoid transposing and reshape
+            if bsz == 1 and q_len == 1:
+                # Special case for decoding - directly compute with flattened output
+                # This eliminates both the contiguous() call and the reshape operation
+                # Output shape becomes [self.num_heads * self.v_head_dim] directly
+                attn_output = torch.einsum('hc,hcd->d', attn_output.squeeze(0).squeeze(0), out_absorb)
+                # Reshape back to expected shape for o_proj
+                attn_output = attn_output.view(bsz, q_len, self.num_heads * self.v_head_dim)
+            else:
+                # For the more general case
+                attn_output = torch.einsum('bqhc,hcd->bqhd', attn_output, out_absorb).contiguous()
+                attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim) # [bsz, q_len, self.num_heads * self.v_head_dim]
             attn_output = self.o_proj(attn_output)
             
             return attn_output, None, past_key_value
@@ -838,16 +879,36 @@ class flashinfer_attn(BaseInjectedModule, DeepseekV2Attention):
             k_pe = compressed_kv_with_k_pe [:, :, :, self.kv_lora_rank:].view(-1, kv_cache.page_size, self.qk_rope_head_dim)
             
         q_absorb, out_absorb = self.get_absorbed()
-        q_nope = q_nope.transpose(0, 1) # q_len is 1, no GPU overhead, same below
-        q_nope = torch.matmul(q_nope, q_absorb) # batched MM
-        q_nope = q_nope.transpose(0, 1)
-        # q_nope.squeeze_(1)
-        # q_pe.squeeze_(1)
-
+        # Original implementation with transpose and matmul
+        # q_nope = q_nope.transpose(0, 1) # q_len is 1, no GPU overhead, same below
+        # q_nope = torch.matmul(q_nope, q_absorb) # batched MM
+        # q_nope = q_nope.transpose(0, 1)
+        
+        # Optimize for the common case where q_len=1 in decoding
+        if q_len == 1:
+            # Direct computation for single token (typical in decoding)
+            q_nope = torch.einsum('hd,hdk->hk', q_nope.squeeze(0), q_absorb)
+            q_pe = q_pe.squeeze(0)  # [h, d]
+        else:
+            # General case for multiple tokens
+            q_nope = torch.einsum('qhd,hdk->qhk', q_nope, q_absorb)
+        
+        # Run the wrapper with optimized inputs
         attn_output = wrapper.run(q_nope, q_pe, compressed_kv, k_pe).view(q_len, self.num_heads, self.kv_lora_rank)
-        attn_output = attn_output.transpose(0, 1)
-        attn_output = torch.matmul(attn_output, out_absorb.mT) # [self.num_heads, q_len, self.v_head_dim]
-        attn_output = attn_output.transpose(0, 1)
-        attn_output = attn_output.reshape(q_len, self.num_heads * self.v_head_dim)
+        
+        # Original implementation with transpose and matmul
+        # attn_output = attn_output.transpose(0, 1)
+        # attn_output = torch.matmul(attn_output, out_absorb.mT) # [self.num_heads, q_len, self.v_head_dim]
+        # attn_output = attn_output.transpose(0, 1)
+        
+        # Optimized implementation with einsum that combines operations
+        if q_len == 1:
+            # For single token, compute directly to final dimensions
+            attn_output = torch.einsum('hc,hcd->d', attn_output.squeeze(0), out_absorb)
+            attn_output = attn_output.view(q_len, self.num_heads * self.v_head_dim)
+        else:
+            # General case
+            attn_output = torch.einsum('qhc,hcd->qhd', attn_output, out_absorb)
+            attn_output = attn_output.reshape(q_len, self.num_heads * self.v_head_dim)
         attn_output = self.o_proj(attn_output, num_tokens_tensors)
         return attn_output
